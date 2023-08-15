@@ -1231,34 +1231,9 @@ enum reachable_words_node_state {
   RootUnprocessed = -2,
   /* This node is one of the roots and the computation for that root has already ran */
   RootProcessed = -3,
-  /* States that are positive integers indicate that a node has only been visited
+  /* States that are non-negative integers indicate that a node has only been visited
    * starting from a single root. The state is then equal to the identifier of the
    * root that we reached it from */
-};
-
-enum reachable_words_traversal_mode {
-  /* Performs the main traversal, for each descendant recording that it is
-   * reachable from the current root.
-   *
-   * Upon encountering a node that hasn't been visited yet, we mark it as visited,
-   * recording our identifier to ensure we avoid double counting it. If it has already
-   * been visited, this means it does not uniquely belong to any owner, so we mark
-   * it as Ignored.
-   *
-   * Returns the total size of elements marked, that is ones that are reachable
-   * from the current root and can be reached by at most one root from the ones
-   * that already ran. */
-  IncrementReachedCount,
-  /* Performs the final traversal, summing up the sizes of descandants that are
-   * only reachable from the current root.
-   *
-   * Assumes that we have previously ran [IncrementReachedCount] to completion,
-   * i.e. our root is in state [RootProcessed] and every other reachable node either
-   * has our identifier or is [Ignored]. While running, we mark all visited nodes
-   * as [Ignored].
-   *
-   * Returns the total size of elements that are marked with our identifier. */
-  ComputeUnique,
 };
 
 /* Performs traversal through the OCaml object reachability graph to deterime
@@ -1271,15 +1246,26 @@ enum reachable_words_traversal_mode {
 
    For each value node visited, we record its traversal status in the [pos] field
    of its entry in [position_table.entries]. The statuses are described in detail
-   in the [reachable_words_node_state] enum. */
+   in the [reachable_words_node_state] enum.
+   
+   Returns the total size of elements marked, that is ones that are reachable
+   from the current root and can be reached by at most one root from the ones
+   that already ran.
+   
+   If [sizes_by_root_id] is not [NULL], we expect it to be an OCaml array
+   with length equal to the number of roots. Then during the traversal we will
+   update the number of words uniquely reachable from each root.
+   That is, when we visit a node for the first time, we add its size to the
+   corresponding root identifier, and when we visit it for the second time, we
+   undo this addition. */
 intnat reachable_words_once(struct caml_extern_state *s,
-    value root, enum reachable_words_traversal_mode mode, intnat identifier) {
+    value root, intnat identifier, value sizes_by_root_id) {
   struct extern_item * sp;
   intnat size;
   uintnat mark, new_mark;
   value v = root;
   uintnat h;
-  int previously_marked, should_traverse;
+  int previously_marked, should_traverse, size_contribution;
   sp = s->extern_stack;
   size = 0;
 
@@ -1290,46 +1276,22 @@ intnat reachable_words_once(struct caml_extern_state *s,
       /* Tagged integers contribute 0 to the size, nothing to do */
     } else {
       previously_marked = extern_lookup_position(s, v, &mark, &h);
-      if (mode == IncrementReachedCount) {
-        if (!previously_marked) {
-          /* Invariant: v != root as we have marked roots before running this function.
-           * So we can safely assign new_mark to identifier */
-          should_traverse = 1;
-          new_mark = identifier;
-        } else if (mark == RootUnprocessed && v == root) {
-          should_traverse = 1;
-          new_mark = RootProcessed;
-        } else if (mark == Ignored || mark == RootUnprocessed || mark == RootProcessed) {
-          should_traverse = 0;
-        } else if (mark == identifier) {
-          should_traverse = 0;
-        } else {
-          /* mark is some other root's identifier */
-          should_traverse = 1;
-          new_mark = Ignored;
-        }
-      } else if (mode == ComputeUnique) {
-        if (!previously_marked) {
-          caml_failwith("reachable_words_once in ComputeUnique mode encountered an unvisited node. "
-              "This is a bug in the standard library implementation.");
-        } else if (mark == RootUnprocessed) {
-          caml_failwith("reachable_words_once in ComputeUnique mode encountered an unprocessed root. "
-              "This is a bug in the standard library implementation.");
-        } else if (mark == RootProcessed && v == root) {
-          should_traverse = 1;
-          new_mark = Ignored;
-        } else if (mark == Ignored || mark == RootProcessed) {
-          should_traverse = 0;
-        } else if (mark == identifier) {
-          should_traverse = 1;
-          new_mark = Ignored;
-        } else {
-          caml_failwith("reachable_words_once in ComputeUnique mode node with identifier of different root. "
-              "This is a bug in the standard library implementation.");
-        }
+      if (!previously_marked) {
+        /* Invariant: v != root as we have marked roots before running this function.
+         * So we can safely assign new_mark to identifier */
+        should_traverse = 1;
+        new_mark = identifier;
+      } else if (mark == RootUnprocessed && v == root) {
+        should_traverse = 1;
+        new_mark = RootProcessed;
+      } else if (mark == Ignored || mark == RootUnprocessed || mark == RootProcessed) {
+        should_traverse = 0;
+      } else if (mark == identifier) {
+        should_traverse = 0;
       } else {
-        caml_failwith("reachable_words_once encountered unknown mode. "
-            "This is a bug in the standard library implementation.");
+        /* mark is some other root's identifier */
+        should_traverse = 1;
+        new_mark = Ignored;
       }
 
       if (should_traverse) {
@@ -1349,6 +1311,17 @@ intnat reachable_words_once(struct caml_extern_state *s,
         }
         /* The block contributes to the total size */
         size += 1 + sz;           /* header word included */
+        if (sizes_by_root_id) {
+          if (new_mark == Ignored) {
+            /* (old_)mark is identifier of some other root that we counted this node
+             * as contributing to. Since it is evidently not uniquely reachable, we
+             * undo this contribution */
+            /* Need to shift left by 1 to respect the OCaml representation of [int] values */
+            Field(sizes_by_root_id, mark) -= (1 + sz) << 1;
+          } else {
+            Field(sizes_by_root_id, identifier) += (1 + sz) << 1;
+          }
+        }
         if (tag < No_scan_tag) {
           /* i is the position of the first field to traverse recursively */
           uintnat i =
@@ -1409,7 +1382,7 @@ CAMLprim value caml_obj_reachable_words(value v)
 
   s = reachable_words_init();
   reachable_words_mark_root(s, v);
-  size = Val_long(reachable_words_once(s, v, IncrementReachedCount, 1));
+  size = Val_long(reachable_words_once(s, v, 0, NULL));
   reachable_words_cleanup(s);
 
   CAMLreturn(size);
@@ -1419,25 +1392,24 @@ CAMLprim value caml_obj_uniquely_reachable_words(value v)
 {
   struct caml_extern_state *s;
   CAMLparam1(v);
-  CAMLlocal1(ret);
+  CAMLlocal1(sizes_by_root_id);
 
   intnat length;
 
   length = Wosize_val(v);
-  ret = caml_alloc(length, 0);
+  sizes_by_root_id = caml_alloc(length, 0);
+  for (intnat i = 0; i < length; i++) {
+    Field(sizes_by_root_id, i) = Val_int(0);
+  }
 
-  s =reachable_words_init();
+  s = reachable_words_init();
   for (intnat i = 0; i < length; i++) {
     reachable_words_mark_root(s, Field(v, i));
   }
   for (intnat i = 0; i < length; i++) {
-    reachable_words_once(s, Field(v, i), IncrementReachedCount, i + 1);
-  }
-  for (intnat i = 0; i < length; i++) {
-    intnat size = reachable_words_once(s, Field(v, i), ComputeUnique, i + 1);
-    Store_field(ret, i, Val_int(size));
+    reachable_words_once(s, Field(v, i), i, sizes_by_root_id);
   }
   reachable_words_cleanup(s);
 
-  CAMLreturn(ret);
+  CAMLreturn(sizes_by_root_id);
 }
