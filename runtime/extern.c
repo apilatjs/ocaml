@@ -108,6 +108,16 @@ struct caml_extern_state {
   struct extern_item * extern_stack;
   struct extern_item * extern_stack_limit;
 
+  /* Stacks for values pending traversal in [reachable_values].
+   * We need to use this split format since we want to register
+   * the array of values as a local root for the garbage collector to
+   * automatically update. */
+  value trv_value_stack_init[EXTERN_STACK_INIT_SIZE];
+  value *trv_value_stack;
+  uintnat trv_offset_stack_init[EXTERN_STACK_INIT_SIZE];
+  uintnat *trv_offset_stack;
+  uintnat trv_stack_cap;
+
   /* Hash table to record already marshalled objects */
   /* Also used by [reachable_words] to keep track of visited values */
   struct table_setup pos_table;
@@ -143,6 +153,9 @@ static struct caml_extern_state* get_extern_state (void)
   extern_state->extern_stack = extern_state->extern_stack_init;
   extern_state->extern_stack_limit =
     extern_state->extern_stack + EXTERN_STACK_INIT_SIZE;
+  extern_state->trv_value_stack = extern_state->trv_value_stack_init;
+  extern_state->trv_offset_stack = extern_state->trv_offset_stack_init;
+  extern_state->trv_stack_cap = EXTERN_STACK_INIT_SIZE;
 
   Caml_state->extern_state = extern_state;
   return extern_state;
@@ -187,6 +200,19 @@ static void extern_free_stack(struct caml_extern_state* s)
   }
 }
 
+static void trv_free_stack(struct caml_extern_state* s)
+{
+  if (s->trv_value_stack != s->trv_value_stack_init) {
+    caml_stat_free(s->trv_value_stack);
+  }
+  if (s->trv_offset_stack != s->trv_offset_stack_init) {
+    caml_stat_free(s->trv_offset_stack);
+  }
+  s->trv_value_stack = s->trv_value_stack_init;
+  s->trv_offset_stack = s->trv_offset_stack_init;
+  s->trv_stack_cap = EXTERN_STACK_INIT_SIZE;
+}
+
 
 static struct extern_item * extern_resize_stack(struct caml_extern_state* s,
                                                 struct extern_item * sp)
@@ -212,6 +238,34 @@ static struct extern_item * extern_resize_stack(struct caml_extern_state* s,
   return newstack + sp_offset;
 }
 
+static void trv_resize_stack(struct caml_extern_state* s)
+{
+  /* This is basically a copy-paste of the code above with adjusted types */
+  asize_t newsize = 2 * s->trv_stack_cap;
+  value *new_value_stack;
+  uintnat *new_offset_stack;
+
+  if (newsize >= EXTERN_STACK_MAX_SIZE) extern_stack_overflow(s);
+  new_value_stack = caml_stat_calloc_noexc(newsize, sizeof(*new_value_stack));
+  if (new_value_stack == NULL) extern_stack_overflow(s);
+  new_offset_stack = caml_stat_calloc_noexc(newsize, sizeof(*new_offset_stack));
+  if (new_offset_stack == NULL) extern_stack_overflow(s);
+
+  /* Copy items from the old stack to the new stack */
+  memcpy (new_value_stack, s->trv_value_stack, sizeof(*new_value_stack) * s->trv_stack_cap);
+  memcpy (new_offset_stack, s->trv_offset_stack, sizeof(*new_offset_stack) * s->trv_stack_cap);
+
+  /* Free the old stack if it is not the initial stack */
+  if (new_value_stack != s->trv_value_stack)
+    caml_stat_free(s->trv_value_stack);
+  if (new_offset_stack != s->trv_offset_stack)
+    caml_stat_free(s->trv_offset_stack);
+
+  s->trv_value_stack = new_value_stack;
+  s->trv_offset_stack = new_offset_stack;
+  s->trv_stack_cap = newsize;
+}
+
 /* Multiplicative Fibonacci hashing
    (Knuth, TAOCP vol 3, section 6.4, page 518).
    HASH_FACTOR is (sqrt(5) - 1) / 2 * 2^wordsize. */
@@ -228,6 +282,7 @@ static struct extern_item * extern_resize_stack(struct caml_extern_state* s,
 /* Initialize the position table */
 
 static void init_table(struct table_setup *setup) {
+  setup->obj_counter = 0;
   setup->table.size = POS_TABLE_INIT_SIZE;
   setup->table.shift = 8 * sizeof(value) - POS_TABLE_INIT_SIZE_LOG2;
   setup->table.mask = POS_TABLE_INIT_SIZE - 1;
@@ -1284,41 +1339,28 @@ enum reachable_words_node_state {
    undo this addition. */
 intnat reachable_words_once(struct caml_extern_state *s,
     value root, intnat identifier, value sizes_by_root_id) {
-  struct extern_item * sp;
-  intnat size;
+  struct caml__roots_block** caml_local_roots_ptr =
+    (DO_CHECK_CAML_STATE ? Caml_check_caml_state() : (void)0, &CAML_LOCAL_ROOTS);
+  struct caml__roots_block *caml__frame = *caml_local_roots_ptr;
+  struct caml__roots_block local_root;
+  local_root.next = *caml_local_roots_ptr;
+  *caml_local_roots_ptr = &local_root;
+
+  uintnat stack_size = 0;
+  intnat size = 0;
   uintnat mark, new_mark;
   value v = root;
   uintnat h;
   int previously_marked, should_traverse;
-  int total_in_young = 0;
-  sp = s->extern_stack;
-  size = 0;
 
   /* In Multicore OCaml, we don't distinguish between major heap blocks and
    * out-of-heap blocks, so we end up counting out-of-heap blocks too. */
   while (1) {
-    if (Is_young(v)) total_in_young++;
     if (caml_incoming_interrupts_queued()) {
-      int stack_size = 0, in_young = 0;
-      printf("ALGO ALLOWING INTERRUPT young=(%p-%p) minor-heaps=(%p-%p)", caml_young_start, caml_young_end, caml_minor_heaps_start, caml_minor_heaps_end);
-      for (struct extern_item *p = s->extern_stack+1; p <= sp; p++) {
-        caml_register_global_root(&p->v);
-        stack_size += 1;
-	if (Is_young((value)p->v)) {
-          in_young += 1;
-	}
-	printf(" %p-(%d)>%p", p->v, p->count, *(p->v));
-      }
-      printf(" stack_size=%d in_young=%d total_in_young=%d\n", stack_size, in_young, total_in_young);
-      fflush(stdout);
+      local_root.nitems = stack_size;
+      local_root.ntables = 1;
+      local_root.tables[0] = s->trv_value_stack;
       caml_handle_incoming_interrupts();
-      printf("DONE");
-      for (struct extern_item *p = s->extern_stack+1; p <= sp; p++) {
-        caml_remove_global_root(&p->v);
-	printf(" %p-(%d)>%p", p->v, p->count, *(p->v));
-      }
-      printf("\n");
-      fflush(stdout);
     }
       
     if (Is_long(v)) {
@@ -1385,13 +1427,11 @@ intnat reachable_words_once(struct caml_extern_state *s,
           if (i < sz) {
             if (i < sz - 1) {
               /* Remember that we need to count fields i + 1 ... sz - 1 */
-              sp++;
-              if (sp >= s->extern_stack_limit)
-                sp = extern_resize_stack(s, sp);
-              //sp->v = &Field(v, i + 1);
-              //sp->count = sz - i - 1;
-              sp->v = (value*)v;
-              sp->count = i+1;
+              stack_size++;
+              if (stack_size >= s->trv_stack_cap)
+                trv_resize_stack(s);
+              s->trv_value_stack[stack_size-1] = v;
+              s->trv_offset_stack[stack_size-1] = i + 1;
             }
             /* Continue with field i */
             v = Field(v, i);
@@ -1402,14 +1442,12 @@ intnat reachable_words_once(struct caml_extern_state *s,
     }
 
     /* Pop one more item to traverse, if any */
-    if (sp == s->extern_stack) break;
-    v = Field((value)(sp->v), sp->count);
-    if (++sp->count == Wosize_val(sp->v)) sp--;
-    //if (--(sp->count) == 0) sp--;
+    if (stack_size == 0) break;
+    v = Field(s->trv_value_stack[stack_size-1], s->trv_offset_stack[stack_size-1]);
+    if (++(s->trv_offset_stack[stack_size-1]) == Wosize_val(s->trv_value_stack[stack_size-1])) stack_size--;
   }
 
-  printf("ROOT %d in_stack=%d\n", identifier, total_in_young);
-
+  *caml_local_roots_ptr = caml__frame;
   return size;
 }
 
@@ -1417,7 +1455,6 @@ struct caml_extern_state* reachable_words_init(void)
 {
   struct caml_extern_state *s = get_extern_state ();
   s->extern_flags = 0;
-  s->pos_table.obj_counter = 0;
   init_table(&s->pos_table);
   return s;
 }
@@ -1432,7 +1469,7 @@ void reachable_words_mark_root(struct caml_extern_state *s, value v)
 
 void reachable_words_cleanup(struct caml_extern_state *s)
 {
-  extern_free_stack(s);
+  trv_free_stack(s);
   free_table(&s->pos_table);
 }
 
