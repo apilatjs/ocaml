@@ -33,6 +33,7 @@
 #include "caml/mlvalues.h"
 #include "caml/reverse.h"
 #include "caml/shared_heap.h"
+#include "caml/domain.h"
 
 /* Flags affecting marshaling */
 
@@ -1289,12 +1290,37 @@ intnat reachable_words_once(struct caml_extern_state *s,
   value v = root;
   uintnat h;
   int previously_marked, should_traverse;
+  int total_in_young = 0;
   sp = s->extern_stack;
   size = 0;
 
   /* In Multicore OCaml, we don't distinguish between major heap blocks and
    * out-of-heap blocks, so we end up counting out-of-heap blocks too. */
   while (1) {
+    if (Is_young(v)) total_in_young++;
+    if (caml_incoming_interrupts_queued()) {
+      int stack_size = 0, in_young = 0;
+      printf("ALGO ALLOWING INTERRUPT young=(%p-%p) minor-heaps=(%p-%p)", caml_young_start, caml_young_end, caml_minor_heaps_start, caml_minor_heaps_end);
+      for (struct extern_item *p = s->extern_stack+1; p <= sp; p++) {
+        caml_register_global_root(&p->v);
+        stack_size += 1;
+	if (Is_young((value)p->v)) {
+          in_young += 1;
+	}
+	printf(" %p-(%d)>%p", p->v, p->count, *(p->v));
+      }
+      printf(" stack_size=%d in_young=%d total_in_young=%d\n", stack_size, in_young, total_in_young);
+      fflush(stdout);
+      caml_handle_incoming_interrupts();
+      printf("DONE");
+      for (struct extern_item *p = s->extern_stack+1; p <= sp; p++) {
+        caml_remove_global_root(&p->v);
+	printf(" %p-(%d)>%p", p->v, p->count, *(p->v));
+      }
+      printf("\n");
+      fflush(stdout);
+    }
+      
     if (Is_long(v)) {
       /* Tagged integers contribute 0 to the size, nothing to do */
     } else {
@@ -1362,8 +1388,10 @@ intnat reachable_words_once(struct caml_extern_state *s,
               sp++;
               if (sp >= s->extern_stack_limit)
                 sp = extern_resize_stack(s, sp);
-              sp->v = &Field(v, i + 1);
-              sp->count = sz - i - 1;
+              //sp->v = &Field(v, i + 1);
+              //sp->count = sz - i - 1;
+              sp->v = (value*)v;
+              sp->count = i+1;
             }
             /* Continue with field i */
             v = Field(v, i);
@@ -1375,9 +1403,12 @@ intnat reachable_words_once(struct caml_extern_state *s,
 
     /* Pop one more item to traverse, if any */
     if (sp == s->extern_stack) break;
-    v = *((sp->v)++);
-    if (--(sp->count) == 0) sp--;
+    v = Field((value)(sp->v), sp->count);
+    if (++sp->count == Wosize_val(sp->v)) sp--;
+    //if (--(sp->count) == 0) sp--;
   }
+
+  printf("ROOT %d in_stack=%d\n", identifier, total_in_young);
 
   return size;
 }
@@ -1442,5 +1473,6 @@ CAMLprim value caml_obj_uniquely_reachable_words(value v)
   }
   reachable_words_cleanup(s);
 
+  printf("ALGO RETURNING\n");
   CAMLreturn(sizes_by_root_id);
 }
