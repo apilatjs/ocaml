@@ -43,7 +43,17 @@ external uniquely_reachable_words : t array -> int array = "caml_obj_uniquely_re
     above by [reachable_words]) of all heap blocks accessible from the
     argument but excluding all blocks accessible from any other arguments.
 
-    @since 4.15
+    This function supports running concurrently (in a separate domain)
+    to OCaml code that is modifying memory reachable from the input array.
+    If memory is modified while [uniquely_reachable_words] is running, the
+    output is best-effort.
+
+    The function will not block garbage collections in other domains but,
+    for performance reasons, if a minor collection happens while the algorithm
+    is running, the returned results could have inaccuracies on the order of
+    the size of the minor heap.
+
+    @since 5.0
   *)
 
 external field : t -> int -> t = "%obj_field"

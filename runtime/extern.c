@@ -82,6 +82,13 @@ struct position_table {
 #define POS_TABLE_INIT_SIZE_LOG2 8
 #define POS_TABLE_INIT_SIZE (1 << POS_TABLE_INIT_SIZE_LOG2)
 
+struct table_setup {
+  uintnat obj_counter;
+  uintnat present_init[Bitvect_size(POS_TABLE_INIT_SIZE)];
+  struct object_position entries_init[POS_TABLE_INIT_SIZE];
+  struct position_table table;
+};
+
 struct output_block {
   struct output_block * next;
   char * end;
@@ -92,7 +99,6 @@ struct caml_extern_state {
 
   int extern_flags;        /* logical or of some of the flags */
 
-  uintnat obj_counter;    /* Number of objects emitted so far */
   uintnat size_32;        /* Size in words of 32-bit block for struct. */
   uintnat size_64;        /* Size in words of 64-bit block for struct. */
 
@@ -102,9 +108,8 @@ struct caml_extern_state {
   struct extern_item * extern_stack_limit;
 
   /* Hash table to record already marshalled objects */
-  uintnat pos_table_present_init[Bitvect_size(POS_TABLE_INIT_SIZE)];
-  struct object_position pos_table_entries_init[POS_TABLE_INIT_SIZE];
-  struct position_table pos_table;
+  /* Also used by [reachable_words] to keep track of visited values */
+  struct table_setup pos_table;
 
   /* To buffer the output */
 
@@ -131,7 +136,7 @@ static struct caml_extern_state* get_extern_state (void)
   }
 
   extern_state->extern_flags = 0;
-  extern_state->obj_counter = 0;
+  extern_state->pos_table.obj_counter = 0;
   extern_state->size_32 = 0;
   extern_state->size_64 = 0;
   extern_state->extern_stack = extern_state->extern_stack_init;
@@ -221,31 +226,38 @@ static struct extern_item * extern_resize_stack(struct caml_extern_state* s,
 
 /* Initialize the position table */
 
+static void init_table(struct table_setup *setup) {
+  setup->table.size = POS_TABLE_INIT_SIZE;
+  setup->table.shift = 8 * sizeof(value) - POS_TABLE_INIT_SIZE_LOG2;
+  setup->table.mask = POS_TABLE_INIT_SIZE - 1;
+  setup->table.threshold = Threshold(POS_TABLE_INIT_SIZE);
+  setup->table.present = setup->present_init;
+  setup->table.entries = setup->entries_init;
+  memset(setup->present_init, 0, Bitvect_size(POS_TABLE_INIT_SIZE) * sizeof(uintnat));
+}
+
 static void extern_init_position_table(struct caml_extern_state* s)
 {
   if (s->extern_flags & NO_SHARING) return;
-  s->pos_table.size = POS_TABLE_INIT_SIZE;
-  s->pos_table.shift = 8 * sizeof(value) - POS_TABLE_INIT_SIZE_LOG2;
-  s->pos_table.mask = POS_TABLE_INIT_SIZE - 1;
-  s->pos_table.threshold = Threshold(POS_TABLE_INIT_SIZE);
-  s->pos_table.present = s->pos_table_present_init;
-  s->pos_table.entries = s->pos_table_entries_init;
-  memset(s->pos_table_present_init, 0,
-         Bitvect_size(POS_TABLE_INIT_SIZE) * sizeof(uintnat));
+  init_table(&s->pos_table);
 }
 
 /* Free the position table */
 
+static void free_table(struct table_setup *setup) {
+  if (setup->table.present != setup->present_init) {
+    caml_stat_free(setup->table.present);
+    caml_stat_free(setup->table.entries);
+    /* Protect against repeated calls to free_table */
+    setup->table.present = setup->present_init;
+    setup->table.entries = setup->entries_init;
+  }
+}
+
 static void extern_free_position_table(struct caml_extern_state* s)
 {
   if (s->extern_flags & NO_SHARING) return;
-  if (s->pos_table.present != s->pos_table_present_init) {
-    caml_stat_free(s->pos_table.present);
-    caml_stat_free(s->pos_table.entries);
-    /* Protect against repeated calls to extern_free_position_table */
-    s->pos_table.present = s->pos_table_present_init;
-    s->pos_table.entries = s->pos_table_entries_init;
-  }
+  free_table(&s->pos_table);
 }
 
 /* Accessing bitvectors */
@@ -262,14 +274,14 @@ Caml_inline void bitvect_set(uintnat * bv, uintnat i)
 
 /* Grow the position table */
 
-static void extern_resize_position_table(struct caml_extern_state *s)
+static int grow_table(struct table_setup *setup)
 {
   mlsize_t new_size, new_byte_size;
   int new_shift;
   uintnat * new_present;
   struct object_position * new_entries;
   uintnat i, h;
-  struct position_table old = s->pos_table;
+  struct position_table old = setup->table;
 
   /* Grow the table quickly (x 8) up to 10^6 entries,
      more slowly (x 2) afterwards. */
@@ -283,38 +295,40 @@ static void extern_resize_position_table(struct caml_extern_state *s)
   if (new_size == 0
       || caml_umul_overflow(new_size, sizeof(struct object_position),
                             &new_byte_size))
-    extern_out_of_memory(s);
+    return 1;
   new_entries = caml_stat_alloc_noexc(new_byte_size);
-  if (new_entries == NULL) extern_out_of_memory(s);
+  if (new_entries == NULL) return 1;
   new_present =
     caml_stat_calloc_noexc(Bitvect_size(new_size), sizeof(uintnat));
   if (new_present == NULL) {
     caml_stat_free(new_entries);
-    extern_out_of_memory(s);
+    return 1;
   }
-  s->pos_table.size = new_size;
-  s->pos_table.shift = new_shift;
-  s->pos_table.mask = new_size - 1;
-  s->pos_table.threshold = Threshold(new_size);
-  s->pos_table.present = new_present;
-  s->pos_table.entries = new_entries;
+  setup->table.size = new_size;
+  setup->table.shift = new_shift;
+  setup->table.mask = new_size - 1;
+  setup->table.threshold = Threshold(new_size);
+  setup->table.present = new_present;
+  setup->table.entries = new_entries;
 
   /* Insert every entry of the old table in the new table */
   for (i = 0; i < old.size; i++) {
     if (! bitvect_test(old.present, i)) continue;
-    h = Hash(old.entries[i].obj, s->pos_table.shift);
+    h = Hash(old.entries[i].obj, setup->table.shift);
     while (bitvect_test(new_present, h)) {
-      h = (h + 1) & s->pos_table.mask;
+      h = (h + 1) & setup->table.mask;
     }
     bitvect_set(new_present, h);
     new_entries[h] = old.entries[i];
   }
 
   /* Free the old tables if they are not the initial ones */
-  if (old.present != s->pos_table_present_init) {
+  if (old.present != setup->present_init) {
     caml_stat_free(old.present);
     caml_stat_free(old.entries);
   }
+
+  return 0;
 }
 
 /* Determine whether the given object [obj] is in the hash table.
@@ -323,56 +337,65 @@ static void extern_resize_position_table(struct caml_extern_state *s)
    Either way, set [*h_out] to the hash value appropriate for
    [extern_record_location]. */
 
-Caml_inline int extern_lookup_position(struct caml_extern_state *s, value obj,
-                                       uintnat * pos_out, uintnat * h_out)
+Caml_inline int lookup_table(struct table_setup *setup,
+                               value obj, uintnat *pos_out, uintnat *h_out)
 {
-  uintnat h = Hash(obj, s->pos_table.shift);
+  uintnat h = Hash(obj, setup->table.shift);
   while (1) {
-    if (! bitvect_test(s->pos_table.present, h)) {
+    if (! bitvect_test(setup->table.present, h)) {
       *h_out = h;
       return 0;
     }
-    if (s->pos_table.entries[h].obj == obj) {
+    if (setup->table.entries[h].obj == obj) {
       *h_out = h;
-      *pos_out = s->pos_table.entries[h].pos;
+      *pos_out = setup->table.entries[h].pos;
       return 1;
     }
-    h = (h + 1) & s->pos_table.mask;
+    h = (h + 1) & setup->table.mask;
   }
+}
+
+Caml_inline int extern_lookup_position(struct caml_extern_state *s, value obj,
+                                       uintnat * pos_out, uintnat * h_out)
+{
+  if (s->extern_flags & NO_SHARING) return 0;
+  return lookup_table(&s->pos_table, obj, pos_out, h_out);
 }
 
 /* Record the given object [obj] in the hashmap, associated to the specified data [data]. */
 /* The [h] parameter is the index in the hash table where the object
    must be inserted.  It was determined during lookup. */
 
-static void extern_record_location_with_data(struct caml_extern_state* s,
-                                   value obj, uintnat h, uintnat data)
+static int record_table(struct table_setup *setup,
+                           value obj, uintnat h, uintnat data)
 {
-  if (s->extern_flags & NO_SHARING) return;
-  bitvect_set(s->pos_table.present, h);
-  s->pos_table.entries[h].obj = obj;
-  s->pos_table.entries[h].pos = data;
-  s->obj_counter++;
-  if (s->obj_counter >= s->pos_table.threshold)
-    extern_resize_position_table(s);
-}
-
-static void extern_record_location(struct caml_extern_state* s,
-                                   value obj, uintnat h)
-{
-  extern_record_location_with_data(s, obj, h, s->obj_counter);
+  bitvect_set(setup->table.present, h);
+  setup->table.entries[h].obj = obj;
+  setup->table.entries[h].pos = data;
+  setup->obj_counter++;
+  if (setup->obj_counter >= setup->table.threshold)
+    return grow_table(setup);
+  return 0;
 }
 
 /* Record the output position for the given object [obj]. */
 /* The [h] parameter is the index in the hash table where the object
    must be inserted.  It was determined during lookup. */
 
-/* Update the data associated with the given object [obj]. */
-static void extern_update_location_with_data(struct caml_extern_state *s,
-                                             uintnat h, uintnat data)
+static void extern_record_location(struct caml_extern_state* s,
+                                   value obj, uintnat h)
 {
   if (s->extern_flags & NO_SHARING) return;
-  s->pos_table.entries[h].pos = data;
+  if (record_table(&s->pos_table, obj, h, s->pos_table.obj_counter))
+    extern_out_of_memory(s);
+}
+
+/* Update the data associated with the given object [obj]. */
+
+static void update_table(struct table_setup *setup,
+                           uintnat h, uintnat data)
+{
+  setup->table.entries[h].pos = data;
 }
 
 /* To buffer the output */
@@ -806,7 +829,7 @@ static void extern_rec(struct caml_extern_state* s, value v)
     /* Check if object already seen */
     if (! (s->extern_flags & NO_SHARING)) {
       if (extern_lookup_position(s, v, &pos, &h)) {
-        extern_shared_reference(s, s->obj_counter - pos);
+        extern_shared_reference(s, s->pos_table.obj_counter - pos);
         goto next_item;
       }
     }
@@ -916,7 +939,7 @@ static intnat extern_value(struct caml_extern_state* s, value v, value flags,
   /* Parse flag list */
   s->extern_flags = caml_convert_flag_list(flags, extern_flag_values);
   /* Initializations */
-  s->obj_counter = 0;
+  s->pos_table.obj_counter = 0;
   s->size_32 = 0;
   s->size_64 = 0;
   /* Marshal the object */
@@ -938,7 +961,7 @@ static intnat extern_value(struct caml_extern_state* s, value v, value flags,
     store32(header, Intext_magic_number_big);
     store32(header + 4, 0);
     store64(header + 8, res_len);
-    store64(header + 16, s->obj_counter);
+    store64(header + 16, s->pos_table.obj_counter);
     store64(header + 24, s->size_64);
     *header_len = 32;
     return res_len;
@@ -947,7 +970,7 @@ static intnat extern_value(struct caml_extern_state* s, value v, value flags,
   /* Use the small header format */
   store32(header, Intext_magic_number_small);
   store32(header + 4, res_len);
-  store32(header + 8, s->obj_counter);
+  store32(header + 8, s->pos_table.obj_counter);
   store32(header + 12, s->size_32);
   store32(header + 16, s->size_64);
   *header_len = 20;
@@ -1252,7 +1275,7 @@ enum reachable_words_node_state {
    from the current root and can be reached by at most one root from the ones
    that already ran.
    
-   If [sizes_by_root_id] is not [NULL], we expect it to be an OCaml array
+   If [sizes_by_root_id] is not [0], we expect it to be an OCaml array
    with length equal to the number of roots. Then during the traversal we will
    update the number of words uniquely reachable from each root.
    That is, when we visit a node for the first time, we add its size to the
@@ -1265,7 +1288,7 @@ intnat reachable_words_once(struct caml_extern_state *s,
   uintnat mark, new_mark;
   value v = root;
   uintnat h;
-  int previously_marked, should_traverse, size_contribution;
+  int previously_marked, should_traverse;
   sp = s->extern_stack;
   size = 0;
 
@@ -1275,7 +1298,7 @@ intnat reachable_words_once(struct caml_extern_state *s,
     if (Is_long(v)) {
       /* Tagged integers contribute 0 to the size, nothing to do */
     } else {
-      previously_marked = extern_lookup_position(s, v, &mark, &h);
+      previously_marked = lookup_table(&s->pos_table, v, &mark, &h);
       if (!previously_marked) {
         /* Invariant: v != root as we have marked roots before running this function.
          * So we can safely assign new_mark to identifier */
@@ -1305,19 +1328,26 @@ intnat reachable_words_once(struct caml_extern_state *s,
         }
         /* Remember that we've visited this block */
         if (!previously_marked) {
-          extern_record_location_with_data(s, v, h, new_mark);
+          if (record_table(&s->pos_table, v, h, new_mark))
+            extern_out_of_memory(s);
         } else {
-          extern_update_location_with_data(s, h, new_mark);
+          update_table(&s->pos_table, h, new_mark);
         }
         /* The block contributes to the total size */
         size += 1 + sz;           /* header word included */
         if (sizes_by_root_id) {
           if (new_mark == Ignored) {
-            /* (old_)mark is identifier of some other root that we counted this node
+#pragma GCC diagnostic push
+            /* GCC complains that [mark] could be uninitialized. This can only happen
+             * if previously_marked returns false. But then new_mark is set to
+             * identifier which by assumption is != Ignored. */
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+            /* is identifier of some other root that we counted this node
              * as contributing to. Since it is evidently not uniquely reachable, we
              * undo this contribution */
             /* Need to shift left by 1 to respect the OCaml representation of [int] values */
             Field(sizes_by_root_id, mark) -= (1 + sz) << 1;
+#pragma GCC diagnostic pop
           } else {
             Field(sizes_by_root_id, identifier) += (1 + sz) << 1;
           }
@@ -1355,23 +1385,24 @@ intnat reachable_words_once(struct caml_extern_state *s,
 struct caml_extern_state* reachable_words_init(void)
 {
   struct caml_extern_state *s = get_extern_state ();
-  s->obj_counter = 0;
   s->extern_flags = 0;
-  extern_init_position_table(s);
+  s->pos_table.obj_counter = 0;
+  init_table(&s->pos_table);
   return s;
 }
 
 void reachable_words_mark_root(struct caml_extern_state *s, value v)
 {
   uintnat h, mark;
-  extern_lookup_position(s, v, &mark, &h);
-  extern_record_location_with_data(s, v, h, RootUnprocessed);
+  lookup_table(&s->pos_table, v, &mark, &h);
+  if (record_table(&s->pos_table, v, h, RootUnprocessed))
+    extern_out_of_memory(s);
 }
 
 void reachable_words_cleanup(struct caml_extern_state *s)
 {
   extern_free_stack(s);
-  extern_free_position_table(s);
+  free_table(&s->pos_table);
 }
 
 CAMLprim value caml_obj_reachable_words(value v)
@@ -1382,7 +1413,7 @@ CAMLprim value caml_obj_reachable_words(value v)
 
   s = reachable_words_init();
   reachable_words_mark_root(s, v);
-  size = Val_long(reachable_words_once(s, v, 0, NULL));
+  size = Val_long(reachable_words_once(s, v, 0, 0));
   reachable_words_cleanup(s);
 
   CAMLreturn(size);
