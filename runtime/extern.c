@@ -122,7 +122,8 @@ struct caml_extern_state {
   /* Also used by [reachable_words] to keep track of visited values */
   struct table_setup pos_table;
 
-  /* Used by [reachable_words] to keep track of visited values on the minor heap. */
+  /* Used by [reachable_words] to keep track of visited values on the minor
+   * heap. */
   struct table_setup young_table;
 
   /* To buffer the output */
@@ -256,8 +257,10 @@ static void trv_resize_stack(struct caml_extern_state* s)
   if (new_offset_stack == NULL) extern_stack_overflow(s);
 
   /* Copy items from the old stack to the new stack */
-  memcpy (new_value_stack, s->trv_value_stack, sizeof(*new_value_stack) * s->trv_stack_cap);
-  memcpy (new_offset_stack, s->trv_offset_stack, sizeof(*new_offset_stack) * s->trv_stack_cap);
+  memcpy (new_value_stack, s->trv_value_stack,
+      sizeof(*new_value_stack) * s->trv_stack_cap);
+  memcpy (new_offset_stack, s->trv_offset_stack,
+      sizeof(*new_offset_stack) * s->trv_stack_cap);
 
   /* Free the old stack if it is not the initial stack */
   if (new_value_stack != s->trv_value_stack)
@@ -293,7 +296,8 @@ static void init_table(struct table_setup *setup) {
   setup->table.threshold = Threshold(POS_TABLE_INIT_SIZE);
   setup->table.present = setup->present_init;
   setup->table.entries = setup->entries_init;
-  memset(setup->present_init, 0, Bitvect_size(POS_TABLE_INIT_SIZE) * sizeof(uintnat));
+  memset(setup->present_init, 0,
+      Bitvect_size(POS_TABLE_INIT_SIZE) * sizeof(uintnat));
 }
 
 static void extern_init_position_table(struct caml_extern_state* s)
@@ -422,7 +426,8 @@ Caml_inline int extern_lookup_position(struct caml_extern_state *s, value obj,
   return lookup_table(&s->pos_table, obj, pos_out, h_out);
 }
 
-/* Record the given object [obj] in the hashmap, associated to the specified data [data]. */
+/* Record the given object [obj] in the hashmap, associated to the specified
+ * [data]. */
 /* The [h] parameter is the index in the hash table where the object
    must be inserted.  It was determined during lookup. */
 
@@ -1305,18 +1310,18 @@ CAMLexport void caml_serialize_block_float_8(void * data, intnat len)
 }
 
 enum reachable_words_node_state {
-  /* This node will be ignored in all traversals. This can happen for two reasons:
-   * - it is reachable from at least two distinct roots, so doesn't have a unique owner
-   * - we are in mode ComputeUnique and this node has already been counted */
-  Ignored = -1,
-  /* This node is one of the roots and has not been visited yet (i.e. the computation
-   * starting at that root still hasn't ran */
+  /* This node is reachable from at least two distinct roots, so it doesn't have
+   * a unique owner and will be ignored in all future traversals */
+  Shared = -1,
+  /* This node is one of the roots and has not been visited yet (i.e. the
+   * computation starting at that root still hasn't ran */
   RootUnprocessed = -2,
-  /* This node is one of the roots and the computation for that root has already ran */
+  /* This node is one of the roots and the computation for that root has already
+   * ran */
   RootProcessed = -3,
-  /* States that are non-negative integers indicate that a node has only been visited
-   * starting from a single root. The state is then equal to the identifier of the
-   * root that we reached it from */
+  /* States that are non-negative integers indicate that a node has only been
+   * visited starting from a single root. The state is then equal to the
+   * identifier of the root that we reached it from */
 };
 
 /* Performs traversal through the OCaml object reachability graph to deterime
@@ -1327,14 +1332,14 @@ enum reachable_words_node_state {
    without clearing the position table to share data between runs starting
    from different roots. Identifiers must be positive integers.
 
-   For each value node visited, we record its traversal status in the [pos] field
-   of its entry in [position_table.entries]. The statuses are described in detail
-   in the [reachable_words_node_state] enum.
-   
+   For each value node visited, we record its traversal status in the [pos]
+   field of its entry in [position_table.entries]. The statuses are described in
+   detail in the [reachable_words_node_state] enum.
+
    Returns the total size of elements marked, that is ones that are reachable
    from the current root and can be reached by at most one root from the ones
    that already ran.
-   
+
    If [sizes_by_root_id] is not [0], we expect it to be an OCaml array
    with length equal to the number of roots. Then during the traversal we will
    update the number of words uniquely reachable from each root.
@@ -1342,11 +1347,12 @@ enum reachable_words_node_state {
    corresponding root identifier, and when we visit it for the second time, we
    undo this addition. */
 
-intnat reachable_words_once(struct caml_extern_state *s,
+static intnat reachable_words_once(struct caml_extern_state *s,
     value root, intnat identifier, value sizes_by_root_id) {
   CAMLassert(identifier >= 0);
   struct caml__roots_block** caml_local_roots_ptr =
-    (DO_CHECK_CAML_STATE ? Caml_check_caml_state() : (void)0, &CAML_LOCAL_ROOTS);
+    (DO_CHECK_CAML_STATE ? Caml_check_caml_state()
+     : (void)0, &CAML_LOCAL_ROOTS);
   struct caml__roots_block *caml__frame = *caml_local_roots_ptr;
 
   struct caml__roots_block local_root_stack;
@@ -1370,9 +1376,11 @@ intnat reachable_words_once(struct caml_extern_state *s,
    * out-of-heap blocks, so we end up counting out-of-heap blocks too. */
   while (1) {
     if (caml_incoming_interrupts_queued()) {
-      value *young_values = caml_stat_alloc_noexc(s->young_table.obj_counter * sizeof(value));
+      value *young_values = caml_stat_alloc_noexc(
+          s->young_table.obj_counter * sizeof(value));
       if (!young_values) extern_out_of_memory(s);
-      uintnat *young_marks = caml_stat_alloc_noexc(s->young_table.obj_counter * sizeof(uintnat));
+      uintnat *young_marks = caml_stat_alloc_noexc(
+          s->young_table.obj_counter * sizeof(uintnat));
       if (!young_marks) extern_out_of_memory(s);
       uintnat saved = 0;
       for (uintnat i = 0; i < s->young_table.table.size; i++) {
@@ -1392,12 +1400,13 @@ intnat reachable_words_once(struct caml_extern_state *s,
       caml_handle_incoming_interrupts();
 
       /* Every time a minor collection happens, we need to iterate through the
-       * whole minor hash table. We want this cost to be proportional to the number
-       * of elements in it, so it makes sense to shrink (free/init) every time
-       * we empty the hashtable. */
+       * whole minor hash table. We want this cost to be proportional to the
+       * number * of elements in it, so it makes sense to shrink (free/init)
+       * every time * we empty the hashtable. */
       init_table(&s->young_table);
       for (uintnat i = 0; i < saved; i++) {
-        previously_marked = lookup_table(&s->pos_table, young_values[i], &mark, &h);
+        previously_marked = lookup_table(&s->pos_table, young_values[i], &mark,
+            &h);
         CAMLassert(!previously_marked);
         if (record_table(&s->pos_table, young_values[i], h, young_marks[i]))
           extern_out_of_memory(s);
@@ -1405,7 +1414,7 @@ intnat reachable_words_once(struct caml_extern_state *s,
       caml_stat_free(young_values);
       caml_stat_free(young_marks);
     }
-      
+
     if (Is_long(v)) {
       /* Tagged integers contribute 0 to the size, nothing to do */
     } else {
@@ -1420,21 +1429,23 @@ intnat reachable_words_once(struct caml_extern_state *s,
       previously_marked = lookup_table(tbl, v, &mark, &h);
       if (!previously_marked) {
         /* All roots must have been marked by [reachable_words_mark_root] before
-         * calling this function so we can safely assign new_mark to identifier */
+         * calling this function so we can safely assign new_mark to
+         * identifier */
         CAMLassert(v != root);
         should_traverse = 1;
         new_mark = identifier;
       } else if (mark == RootUnprocessed && v == root) {
         should_traverse = 1;
         new_mark = RootProcessed;
-      } else if (mark == Ignored || mark == RootUnprocessed || mark == RootProcessed) {
+      } else if (mark == Shared || mark == RootUnprocessed
+          || mark == RootProcessed) {
         should_traverse = 0;
       } else if (mark == identifier) {
         should_traverse = 0;
       } else {
         /* mark is some other root's identifier */
         should_traverse = 1;
-        new_mark = Ignored;
+        new_mark = Shared;
       }
 
       if (should_traverse) {
@@ -1458,16 +1469,17 @@ intnat reachable_words_once(struct caml_extern_state *s,
         /* The block contributes to the total size */
         size += 1 + sz;           /* header word included */
         if (sizes_by_root_id) {
-          if (new_mark == Ignored) {
+          if (new_mark == Shared) {
 #pragma GCC diagnostic push
-            /* GCC complains that [mark] could be uninitialized. This can only happen
-             * if previously_marked returns false. But then new_mark is set to
-             * identifier which by assumption is != Ignored. */
+            /* GCC complains that [mark] could be uninitialized. This can only
+             * happen * if previously_marked returns false. But then new_mark is
+             * set to * identifier which by assumption is != Shared. */
 #pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
             /* mark is identifier of some other root that we counted this node
-             * as contributing to. Since it is evidently not uniquely reachable, we
-             * undo this contribution */
-            /* Need to shift left by 1 to respect the OCaml representation of [int] values */
+             * as contributing to. Since it is evidently not uniquely reachable,
+             * we undo this contribution */
+            /* Need to shift left by 1 to respect the OCaml representation of
+             * [int] values */
             Field(sizes_by_root_id, mark) -= (1 + sz) << 1;
 #pragma GCC diagnostic pop
           } else {
@@ -1498,15 +1510,18 @@ intnat reachable_words_once(struct caml_extern_state *s,
 
     /* Pop one more item to traverse, if any */
     if (stack_size == 0) break;
-    v = Field(s->trv_value_stack[stack_size-1], s->trv_offset_stack[stack_size-1]);
-    if (++(s->trv_offset_stack[stack_size-1]) == Wosize_val(s->trv_value_stack[stack_size-1])) stack_size--;
+    v = Field(s->trv_value_stack[stack_size-1],
+        s->trv_offset_stack[stack_size-1]);
+    if (++(s->trv_offset_stack[stack_size-1])
+        == Wosize_val(s->trv_value_stack[stack_size-1]))
+      stack_size--;
   }
 
   *caml_local_roots_ptr = caml__frame;
   return size;
 }
 
-struct caml_extern_state* reachable_words_init(void)
+static struct caml_extern_state* reachable_words_init(void)
 {
   struct caml_extern_state *s = get_extern_state ();
   s->extern_flags = 0;
@@ -1515,7 +1530,7 @@ struct caml_extern_state* reachable_words_init(void)
   return s;
 }
 
-void reachable_words_mark_root(struct caml_extern_state *s, value v)
+static void reachable_words_mark_root(struct caml_extern_state *s, value v)
 {
   uintnat h, mark;
   struct table_setup *tbl;
@@ -1529,7 +1544,7 @@ void reachable_words_mark_root(struct caml_extern_state *s, value v)
     extern_out_of_memory(s);
 }
 
-void reachable_words_cleanup(struct caml_extern_state *s)
+static void reachable_words_cleanup(struct caml_extern_state *s)
 {
   trv_free_stack(s);
   free_table(&s->pos_table);

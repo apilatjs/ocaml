@@ -38,7 +38,8 @@ external reachable_words : t -> int = "caml_obj_reachable_words"
      @since 4.04
   *)
 
-external uniquely_reachable_words : t array -> int array = "caml_obj_uniquely_reachable_words"
+external uniquely_reachable_words : t array -> int array =
+  "caml_obj_uniquely_reachable_words"
 (** For each element of the array, computes the total size (as defined
     above by [reachable_words]) of all heap blocks accessible from the
     argument but excluding all blocks accessible from any other arguments.
