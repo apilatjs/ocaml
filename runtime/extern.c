@@ -263,9 +263,9 @@ static void trv_resize_stack(struct caml_extern_state* s)
       sizeof(*new_offset_stack) * s->trv_stack_cap);
 
   /* Free the old stack if it is not the initial stack */
-  if (new_value_stack != s->trv_value_stack)
+  if (s->trv_value_stack_init != s->trv_value_stack)
     caml_stat_free(s->trv_value_stack);
-  if (new_offset_stack != s->trv_offset_stack)
+  if (s->trv_offset_stack_init != s->trv_offset_stack)
     caml_stat_free(s->trv_offset_stack);
 
   s->trv_value_stack = new_value_stack;
@@ -296,8 +296,10 @@ static void init_table(struct table_setup *setup) {
   setup->table.threshold = Threshold(POS_TABLE_INIT_SIZE);
   setup->table.present = setup->present_init;
   setup->table.entries = setup->entries_init;
-  memset(setup->present_init, 0,
+  memset(setup->table.present, 0,
       Bitvect_size(POS_TABLE_INIT_SIZE) * sizeof(uintnat));
+  memset(setup->table.entries, 0,
+      POS_TABLE_INIT_SIZE * sizeof(*setup->table.entries));
 }
 
 static void extern_init_position_table(struct caml_extern_state* s)
@@ -1349,11 +1351,9 @@ enum reachable_words_node_state {
 
 static intnat reachable_words_once(struct caml_extern_state *s,
     value root, intnat identifier, value sizes_by_root_id) {
+  CAMLparam2(root, sizes_by_root_id);
+  CAMLlocal1(v);
   CAMLassert(identifier >= 0);
-  struct caml__roots_block** caml_local_roots_ptr =
-    (DO_CHECK_CAML_STATE ? Caml_check_caml_state()
-     : (void)0, &CAML_LOCAL_ROOTS);
-  struct caml__roots_block *caml__frame = *caml_local_roots_ptr;
 
   struct caml__roots_block local_root_stack;
   local_root_stack.next = *caml_local_roots_ptr;
@@ -1368,9 +1368,9 @@ static intnat reachable_words_once(struct caml_extern_state *s,
   uintnat stack_size = 0;
   intnat size = 0;
   uintnat mark, new_mark;
-  value v = root;
   uintnat h;
   int previously_marked, should_traverse;
+  v = root;
 
   /* In Multicore OCaml, we don't distinguish between major heap blocks and
    * out-of-heap blocks, so we end up counting out-of-heap blocks too. */
@@ -1401,15 +1401,21 @@ static intnat reachable_words_once(struct caml_extern_state *s,
 
       /* Every time a minor collection happens, we need to iterate through the
        * whole minor hash table. We want this cost to be proportional to the
-       * number * of elements in it, so it makes sense to shrink (free/init)
-       * every time * we empty the hashtable. */
+       * number of elements in it, so it makes sense to shrink (free/init)
+       * every time we empty the hashtable. */
       init_table(&s->young_table);
       for (uintnat i = 0; i < saved; i++) {
         previously_marked = lookup_table(&s->pos_table, young_values[i], &mark,
             &h);
-        CAMLassert(!previously_marked);
-        if (record_table(&s->pos_table, young_values[i], h, young_marks[i]))
-          extern_out_of_memory(s);
+	/* [previously_marked] could be true if there used to exist a different
+	 * object at the same location that has since been freed. In that case,
+	 * we simply ignore the old record and overwrite it with our new one */
+	if (previously_marked) {
+          update_table(&s->pos_table, h, young_marks[i]);
+	} else {
+          if (record_table(&s->pos_table, young_values[i], h, young_marks[i]))
+            extern_out_of_memory(s);
+	}
       }
       caml_stat_free(young_values);
       caml_stat_free(young_marks);
@@ -1517,8 +1523,7 @@ static intnat reachable_words_once(struct caml_extern_state *s,
       stack_size--;
   }
 
-  *caml_local_roots_ptr = caml__frame;
-  return size;
+  CAMLreturnT(intnat, size);
 }
 
 static struct caml_extern_state* reachable_words_init(void)
