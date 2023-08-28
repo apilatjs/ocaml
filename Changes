@@ -14,6 +14,9 @@ OCaml 5.0
 
 ### Runtime system:
 
+- #?????: Add Obj.uniquely_reachable_words
+  (apilatjs, lukemaurer)
+
 - #11400: Runtime events counters fixes
   Fixes mismatch between OCaml and C APIs, removes events from 4.x that
   are not present in the 5.0 GC and adds some missing probes.

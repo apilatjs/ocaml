@@ -38,6 +38,23 @@ external reachable_words : t -> int = "caml_obj_reachable_words"
      @since 4.04
   *)
 
+external uniquely_reachable_words : t array -> int array * int =
+  "caml_obj_uniquely_reachable_words"
+(** For each element of the array, computes the total size (as defined
+    above by [reachable_words]) of all heap blocks accessible from the
+    argument but excluding all blocks accessible from any other arguments.
+
+    Also returns a single number denoting the total memory reachable from
+    at least two of the roots. We make no attempt to classify which two
+    (or more) roots are responsible for this memory.
+
+    This function supports running concurrently (in a separate domain)
+    to OCaml code that is modifying memory reachable from the input array,
+    and will not block garbage collection initiated by other domains.
+    If memory is modified while [uniquely_reachable_words] is running, the
+    output is best-effort.
+  *)
+
 external field : t -> int -> t = "%obj_field"
 
 (** When using flambda:
