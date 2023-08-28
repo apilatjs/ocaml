@@ -1357,11 +1357,16 @@ static void add_to_long_value(value *v, intnat x) {
    update the number of words uniquely reachable from each root.
    That is, when we visit a node for the first time, we add its size to the
    corresponding root identifier, and when we visit it for the second time, we
-   undo this addition. */
+   undo this addition.
+
+   If an asynchronous exception occurs when processing pending actions
+   caused by other domains, it is written to [exn] and the function exits
+   immediately, reporting the total size of elements marked so far. This is an
+   error condition and calling code should likely reraise the exception. */
 
 static intnat reachable_words_once(struct caml_extern_state *s,
     value root, intnat identifier, value sizes_by_root_id,
-    intnat *shared_size) {
+    intnat *shared_size, value *exn) {
   CAMLparam2(root, sizes_by_root_id);
   CAMLlocal1(v);
   CAMLassert(identifier >= 0);
@@ -1386,7 +1391,7 @@ static intnat reachable_words_once(struct caml_extern_state *s,
   /* In Multicore OCaml, we don't distinguish between major heap blocks and
    * out-of-heap blocks, so we end up counting out-of-heap blocks too. */
   while (1) {
-    if (caml_incoming_interrupts_queued()) {
+    if (caml_check_pending_actions()) {
       value *young_values = caml_stat_alloc_noexc(
           s->young_table.obj_counter * sizeof(value));
       if (!young_values) extern_out_of_memory(s);
@@ -1408,7 +1413,13 @@ static intnat reachable_words_once(struct caml_extern_state *s,
       local_root_stack.tables[0] = s->trv_value_stack;
       local_root_hashtbl.nitems = saved;
       local_root_hashtbl.tables[0] = young_values;
-      caml_handle_incoming_interrupts();
+
+      *exn = caml_process_pending_actions_exn();
+      if (Is_exception_result(*exn)) {
+        caml_stat_free(young_values);
+        caml_stat_free(young_marks);
+        CAMLreturnT(intnat, size);
+      }
 
       /* Every time a minor collection happens, we need to iterate through the
        * whole minor hash table. We want this cost to be proportional to the
@@ -1570,14 +1581,19 @@ CAMLprim value caml_obj_reachable_words(value v)
 {
   struct caml_extern_state *s;
   CAMLparam1(v);
-  CAMLlocal1(size);
+  CAMLlocal2(size, exn);
 
   intnat shared_size = 0;
 
   s = reachable_words_init();
   reachable_words_mark_root(s, v);
-  size = Val_long(reachable_words_once(s, v, 0, Val_unit, &shared_size));
+  size = Val_long(reachable_words_once(s, v, 0, Val_unit, &shared_size, &exn));
   reachable_words_cleanup(s);
+  if (Is_exception_result(exn)) {
+    CAMLdrop;
+    caml_raise(Extract_exception(exn));
+    /* no return */
+  }
 
   CAMLreturn(size);
 }
@@ -1586,7 +1602,7 @@ CAMLprim value caml_obj_uniquely_reachable_words(value v)
 {
   struct caml_extern_state *s;
   CAMLparam1(v);
-  CAMLlocal2(sizes_by_root_id, ret);
+  CAMLlocal3(sizes_by_root_id, ret, exn);
 
   intnat length, shared_size = 0;
 
@@ -1601,7 +1617,14 @@ CAMLprim value caml_obj_uniquely_reachable_words(value v)
     reachable_words_mark_root(s, Field(v, i));
   }
   for (intnat i = 0; i < length; i++) {
-    reachable_words_once(s, Field(v, i), i, sizes_by_root_id, &shared_size);
+    reachable_words_once(s, Field(v, i), i, sizes_by_root_id, &shared_size,
+        &exn);
+    if (Is_exception_result(exn)) {
+      reachable_words_cleanup(s);
+      CAMLdrop;
+      caml_raise(Extract_exception(exn));
+      /* no return */
+    }
   }
   reachable_words_cleanup(s);
 
