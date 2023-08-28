@@ -27,7 +27,7 @@ let [@inline always] is_block a = not (is_int a)
 external tag : t -> int = "caml_obj_tag" [@@noalloc]
 external size : t -> int = "%obj_size"
 external reachable_words : t -> int = "caml_obj_reachable_words"
-external uniquely_reachable_words : t array -> int array =
+external uniquely_reachable_words : t array -> int array * int =
   "caml_obj_uniquely_reachable_words"
 external field : t -> int -> t = "%obj_field"
 external set_field : t -> int -> t -> unit = "%obj_set_field"

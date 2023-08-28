@@ -1321,10 +1321,16 @@ enum reachable_words_node_state {
   /* This node is one of the roots and the computation for that root has already
    * ran */
   RootProcessed = -3,
+  /* Sentinel value for a state that should never be observed */
+  Invalid = -4,
   /* States that are non-negative integers indicate that a node has only been
    * visited starting from a single root. The state is then equal to the
    * identifier of the root that we reached it from */
 };
+
+static void add_to_long_value(value *v, intnat x) {
+  *v = Val_long(Long_val(*v) + x);
+}
 
 /* Performs traversal through the OCaml object reachability graph to deterime
    how much memory an object has access to.
@@ -1342,7 +1348,11 @@ enum reachable_words_node_state {
    from the current root and can be reached by at most one root from the ones
    that already ran.
 
-   If [sizes_by_root_id] is not [0], we expect it to be an OCaml array
+   [shared_size] is incremented by the total size of elements that were newly
+   marked [Shared], that is ones that we just found out are reachable from at
+   least two roots.
+
+   If [sizes_by_root_id] is not [Val_unit], we expect it to be an OCaml array
    with length equal to the number of roots. Then during the traversal we will
    update the number of words uniquely reachable from each root.
    That is, when we visit a node for the first time, we add its size to the
@@ -1350,7 +1360,8 @@ enum reachable_words_node_state {
    undo this addition. */
 
 static intnat reachable_words_once(struct caml_extern_state *s,
-    value root, intnat identifier, value sizes_by_root_id) {
+    value root, intnat identifier, value sizes_by_root_id,
+    intnat *shared_size) {
   CAMLparam2(root, sizes_by_root_id);
   CAMLlocal1(v);
   CAMLassert(identifier >= 0);
@@ -1367,7 +1378,7 @@ static intnat reachable_words_once(struct caml_extern_state *s,
 
   uintnat stack_size = 0;
   intnat size = 0;
-  uintnat mark, new_mark;
+  uintnat mark = Invalid, new_mark;
   uintnat h;
   int previously_marked, should_traverse;
   v = root;
@@ -1407,15 +1418,15 @@ static intnat reachable_words_once(struct caml_extern_state *s,
       for (uintnat i = 0; i < saved; i++) {
         previously_marked = lookup_table(&s->pos_table, young_values[i], &mark,
             &h);
-	/* [previously_marked] could be true if there used to exist a different
-	 * object at the same location that has since been freed. In that case,
-	 * we simply ignore the old record and overwrite it with our new one */
-	if (previously_marked) {
+        /* [previously_marked] could be true if there used to exist a different
+         * object at the same location that has since been freed. In that case,
+         * we simply ignore the old record and overwrite it with our new one */
+        if (previously_marked) {
           update_table(&s->pos_table, h, young_marks[i]);
-	} else {
+        } else {
           if (record_table(&s->pos_table, young_values[i], h, young_marks[i]))
             extern_out_of_memory(s);
-	}
+        }
       }
       caml_stat_free(young_values);
       caml_stat_free(young_marks);
@@ -1424,6 +1435,16 @@ static intnat reachable_words_once(struct caml_extern_state *s,
     if (Is_long(v)) {
       /* Tagged integers contribute 0 to the size, nothing to do */
     } else {
+      header_t hd = Hd_val(v);
+      tag_t tag = Tag_hd(hd);
+      mlsize_t sz = Wosize_hd(hd);
+      intnat sz_with_header = 1 + sz;
+      /* Infix pointer: go back to containing closure */
+      if (tag == Infix_tag) {
+        v = v - Infix_offset_hd(hd);
+        continue;
+      }
+
       /* Use separate hash tables for blocks in minor and major heaps */
       struct table_setup *tbl;
       if (Is_young(v)) {
@@ -1449,21 +1470,14 @@ static intnat reachable_words_once(struct caml_extern_state *s,
       } else if (mark == identifier) {
         should_traverse = 0;
       } else {
-        /* mark is some other root's identifier */
+        CAMLassert(mark >= 0 && mark != identifier);
+        /* mark is some other root's identifier, so in particular
+         * mark != Invalid */
         should_traverse = 1;
         new_mark = Shared;
       }
 
       if (should_traverse) {
-        header_t hd = Hd_val(v);
-        tag_t tag = Tag_hd(hd);
-        mlsize_t sz = Wosize_hd(hd);
-        /* Infix pointer: go back to containing closure */
-        if (tag == Infix_tag) {
-          v = v - Infix_offset_hd(hd);
-          continue;
-        }
-
         /* Remember that we've visited this block */
         if (!previously_marked) {
           if (record_table(tbl, v, h, new_mark))
@@ -1473,23 +1487,19 @@ static intnat reachable_words_once(struct caml_extern_state *s,
         }
 
         /* The block contributes to the total size */
-        size += 1 + sz;           /* header word included */
-        if (sizes_by_root_id) {
+        size += sz_with_header;           /* header word included */
+        if (sizes_by_root_id != Val_unit) {
           if (new_mark == Shared) {
-#pragma GCC diagnostic push
-            /* GCC complains that [mark] could be uninitialized. This can only
-             * happen * if previously_marked returns false. But then new_mark is
-             * set to * identifier which by assumption is != Shared. */
-#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
             /* mark is identifier of some other root that we counted this node
              * as contributing to. Since it is evidently not uniquely reachable,
              * we undo this contribution */
-            /* Need to shift left by 1 to respect the OCaml representation of
-             * [int] values */
-            Field(sizes_by_root_id, mark) -= (1 + sz) << 1;
-#pragma GCC diagnostic pop
+            add_to_long_value(&Field(sizes_by_root_id, mark), -sz_with_header);
+            *shared_size += sz_with_header;
           } else {
-            Field(sizes_by_root_id, identifier) += (1 + sz) << 1;
+            CAMLassert(new_mark == identifier ||
+                (v == root && new_mark == RootProcessed));
+            add_to_long_value(&Field(sizes_by_root_id, identifier),
+                sz_with_header);
           }
         }
 
@@ -1562,9 +1572,11 @@ CAMLprim value caml_obj_reachable_words(value v)
   CAMLparam1(v);
   CAMLlocal1(size);
 
+  intnat shared_size = 0;
+
   s = reachable_words_init();
   reachable_words_mark_root(s, v);
-  size = Val_long(reachable_words_once(s, v, 0, 0));
+  size = Val_long(reachable_words_once(s, v, 0, Val_unit, &shared_size));
   reachable_words_cleanup(s);
 
   CAMLreturn(size);
@@ -1574,9 +1586,9 @@ CAMLprim value caml_obj_uniquely_reachable_words(value v)
 {
   struct caml_extern_state *s;
   CAMLparam1(v);
-  CAMLlocal1(sizes_by_root_id);
+  CAMLlocal2(sizes_by_root_id, ret);
 
-  intnat length;
+  intnat length, shared_size = 0;
 
   length = Wosize_val(v);
   sizes_by_root_id = caml_alloc(length, 0);
@@ -1589,9 +1601,12 @@ CAMLprim value caml_obj_uniquely_reachable_words(value v)
     reachable_words_mark_root(s, Field(v, i));
   }
   for (intnat i = 0; i < length; i++) {
-    reachable_words_once(s, Field(v, i), i, sizes_by_root_id);
+    reachable_words_once(s, Field(v, i), i, sizes_by_root_id, &shared_size);
   }
   reachable_words_cleanup(s);
 
-  CAMLreturn(sizes_by_root_id);
+  ret = caml_alloc_small(2, 0);
+  Field(ret, 0) = sizes_by_root_id;
+  Field(ret, 1) = Val_long(shared_size);
+  CAMLreturn(ret);
 }
