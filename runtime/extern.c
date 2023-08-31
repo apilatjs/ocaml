@@ -1311,21 +1311,29 @@ CAMLexport void caml_serialize_block_float_8(void * data, intnat len)
 #endif
 }
 
+/* The node state is stored in the hashmap in the [pos] field of
+   [object_position].
+   The top byte of the state stores the number of distinct roots that this
+   node is reachable from, or one of the special values below.
+   The bottom bytes store the identifier of the last root that visited this
+   node. This must be an unsigned integer. */
+#define RETAINER_SET_MAX_SIZE (8)
+#define State_shift (8 * sizeof(intnat) - 8)
+#define Decode_state(x) ((enum reachable_words_node_state) ((uintnat)(x) >> State_shift))
+#define Decode_identifier(x) ((uintnat) ((uintnat)(x) & ((1ULL << State_shift) - 1)))
+#define Encode(st, id) (((uintnat)(st) << State_shift) + (uintnat)(id))
 enum reachable_words_node_state {
-  /* This node is reachable from at least two distinct roots, so it doesn't have
-   * a unique owner and will be ignored in all future traversals */
-  Shared = -1,
-  /* This node is one of the roots and has not been visited yet (i.e. the
-   * computation starting at that root still hasn't ran */
-  RootUnprocessed = -2,
-  /* This node is one of the roots and the computation for that root has already
-   * ran */
-  RootProcessed = -3,
   /* Sentinel value for a state that should never be observed */
-  Invalid = -4,
-  /* States that are non-negative integers indicate that a node has only been
-   * visited starting from a single root. The state is then equal to the
-   * identifier of the root that we reached it from */
+  Invalid = 0xff,
+  /* This node is one of the roots, so it will not be traversed starting from
+     any other root */
+  Root = 0xfe,
+  /* This node has been visited starting from at least RETAINER_SET_MAX_SIZE
+     distinct roots. We refuse to track more owners than this, so it will be
+     ignored in all future traversals */
+  Shared = RETAINER_SET_MAX_SIZE,
+  /* States which are integers between 0 and RETAINER_SET_MAX_SIZE - 1 record
+     the number of distinct roots that have reached this node */
 };
 
 static void add_to_long_value(value *v, intnat x) {
@@ -1365,28 +1373,32 @@ static void add_to_long_value(value *v, intnat x) {
    error condition and calling code should likely reraise the exception. */
 
 static intnat reachable_words_once(struct caml_extern_state *s,
-    value root, intnat identifier, value sizes_by_root_id,
+    value root, uintnat identifier, value sizes_by_root_id,
     intnat *shared_size, value *exn) {
+  uintnat stack_size;
+  intnat size;
+  uintnat mark, new_mark, old_identifier;
+  enum reachable_words_node_state state, new_state;
+  uintnat h;
+  int previously_marked, should_traverse;
+  struct caml__roots_block local_root_stack, local_root_hashtbl;
+
   CAMLparam2(root, sizes_by_root_id);
   CAMLlocal1(v);
-  CAMLassert(identifier >= 0);
 
-  struct caml__roots_block local_root_stack;
+  CAMLassert(identifier > 0);
+
   local_root_stack.next = *caml_local_roots_ptr;
   *caml_local_roots_ptr = &local_root_stack;
   local_root_stack.ntables = 1;
 
-  struct caml__roots_block local_root_hashtbl;
   local_root_hashtbl.next = *caml_local_roots_ptr;
   *caml_local_roots_ptr = &local_root_hashtbl;
   local_root_hashtbl.ntables = 1;
 
-  uintnat stack_size = 0;
-  intnat size = 0;
-  uintnat mark = Invalid, new_mark;
-  uintnat h;
-  int previously_marked, should_traverse;
+  stack_size = size = 0;
   v = root;
+  mark = Invalid;
 
   /* In Multicore OCaml, we don't distinguish between major heap blocks and
    * out-of-heap blocks, so we end up counting out-of-heap blocks too. */
@@ -1467,29 +1479,33 @@ static intnat reachable_words_once(struct caml_extern_state *s,
       previously_marked = lookup_table(tbl, v, &mark, &h);
       if (!previously_marked) {
         /* All roots must have been marked by [reachable_words_mark_root] before
-         * calling this function so we can safely assign new_mark to
-         * identifier */
+         * calling this function so we can safely assign new_state to 1 */
         CAMLassert(v != root);
         should_traverse = 1;
-        new_mark = identifier;
-      } else if (mark == RootUnprocessed && v == root) {
-        should_traverse = 1;
-        new_mark = RootProcessed;
-      } else if (mark == Shared || mark == RootUnprocessed
-          || mark == RootProcessed) {
-        should_traverse = 0;
-      } else if (mark == identifier) {
-        should_traverse = 0;
+        new_state = 1;
       } else {
-        CAMLassert(mark >= 0 && mark != identifier);
-        /* mark is some other root's identifier, so in particular
-         * mark != Invalid */
-        should_traverse = 1;
-        new_mark = Shared;
+        state = Decode_state(mark);
+        old_identifier = Decode_identifier(mark);
+
+        CAMLassert(state != Invalid && old_identifier <= identifier);
+        if (old_identifier == identifier) {
+          /* We have already visited this node starting from this root */
+          should_traverse = 0;
+        } else if (state == Root && v == root) {
+          should_traverse = 1;
+          new_state = Root;
+        } else if (state == Root || state == Shared) {
+          should_traverse = 0;
+        } else {
+          CAMLassert(0 < state && state < RETAINER_SET_MAX_SIZE);
+          should_traverse = 1;
+          new_state = state + 1;
+        }
       }
 
       if (should_traverse) {
         /* Remember that we've visited this block */
+        new_mark = Encode(new_state, identifier);
         if (!previously_marked) {
           if (record_table(tbl, v, h, new_mark))
             extern_out_of_memory(s);
@@ -1500,17 +1516,13 @@ static intnat reachable_words_once(struct caml_extern_state *s,
         /* The block contributes to the total size */
         size += sz_with_header;           /* header word included */
         if (sizes_by_root_id != Val_unit) {
-          if (new_mark == Shared) {
-            /* mark is identifier of some other root that we counted this node
-             * as contributing to. Since it is evidently not uniquely reachable,
-             * we undo this contribution */
-            add_to_long_value(&Field(sizes_by_root_id, mark), -sz_with_header);
-            *shared_size += sz_with_header;
-          } else {
-            CAMLassert(new_mark == identifier ||
-                (v == root && new_mark == RootProcessed));
-            add_to_long_value(&Field(sizes_by_root_id, identifier),
+          if (new_state == 1 || new_state == Root) {
+            add_to_long_value(&Field(sizes_by_root_id, identifier - 1),
                 sz_with_header);
+          } else if (new_state == 2) {
+            add_to_long_value(&Field(sizes_by_root_id, old_identifier - 1),
+                -sz_with_header);
+            *shared_size += sz_with_header;
           }
         }
 
@@ -1566,7 +1578,7 @@ static void reachable_words_mark_root(struct caml_extern_state *s, value v)
     tbl = &s->pos_table;
   }
   lookup_table(tbl, v, &mark, &h);
-  if (record_table(tbl, v, h, RootUnprocessed))
+  if (record_table(tbl, v, h, Encode(Root, 0)))
     extern_out_of_memory(s);
 }
 
@@ -1587,7 +1599,7 @@ CAMLprim value caml_obj_reachable_words(value v)
 
   s = reachable_words_init();
   reachable_words_mark_root(s, v);
-  size = Val_long(reachable_words_once(s, v, 0, Val_unit, &shared_size, &exn));
+  size = Val_long(reachable_words_once(s, v, 1, Val_unit, &shared_size, &exn));
   reachable_words_cleanup(s);
   if (Is_exception_result(exn)) {
     CAMLdrop;
@@ -1617,7 +1629,7 @@ CAMLprim value caml_obj_uniquely_reachable_words(value v)
     reachable_words_mark_root(s, Field(v, i));
   }
   for (intnat i = 0; i < length; i++) {
-    reachable_words_once(s, Field(v, i), i, sizes_by_root_id, &shared_size,
+    reachable_words_once(s, Field(v, i), i + 1, sizes_by_root_id, &shared_size,
         &exn);
     if (Is_exception_result(exn)) {
       reachable_words_cleanup(s);
