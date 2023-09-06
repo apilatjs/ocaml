@@ -1317,10 +1317,10 @@ CAMLexport void caml_serialize_block_float_8(void * data, intnat len)
    node is reachable from, or one of the special values below.
    The bottom bytes store the identifier of the last root that visited this
    node. This must be an unsigned integer. */
-#define RETAINER_SET_MAX_SIZE (8)
 #define State_shift (8 * sizeof(intnat) - 8)
+#define Max_identifier ((uintnat) ((1ULL << State_shift) - 1))
 #define Decode_state(x) ((enum reachable_words_node_state) ((uintnat)(x) >> State_shift))
-#define Decode_identifier(x) ((uintnat) ((uintnat)(x) & ((1ULL << State_shift) - 1)))
+#define Decode_identifier(x) ((uintnat) ((uintnat)(x) & Max_identifier))
 #define Encode(st, id) (((uintnat)(st) << State_shift) + (uintnat)(id))
 enum reachable_words_node_state {
   /* Sentinel value for a state that should never be observed */
@@ -1328,12 +1328,11 @@ enum reachable_words_node_state {
   /* This node is one of the roots, so it will not be traversed starting from
      any other root */
   Root = 0xfe,
-  /* This node has been visited starting from at least RETAINER_SET_MAX_SIZE
-     distinct roots. We refuse to track more owners than this, so it will be
-     ignored in all future traversals */
-  Shared = RETAINER_SET_MAX_SIZE,
-  /* States which are integers between 0 and RETAINER_SET_MAX_SIZE - 1 record
-     the number of distinct roots that have reached this node */
+  /* States which are integers between 0 and Retainer_set_size_limit record
+     the number of distinct roots that have reached this node. The
+     algorithm will stop counting at some configurable max retainer set size
+     which will likely be lower than this.  */
+  Retainer_set_size_limit = 0xfd,
 };
 
 static void add_to_long_value(value *v, intnat x) {
@@ -1344,7 +1343,7 @@ static void add_to_long_value(value *v, intnat x) {
    how much memory an object has access to.
 
    Assumes that the position_table has already been initialized using
-   [reachable_words_init].  We can run this function multiple times
+   [reachable_words_init]. We can run this function multiple times
    without clearing the position table to share data between runs starting
    from different roots. Identifiers must be positive integers.
 
@@ -1360,7 +1359,7 @@ static void add_to_long_value(value *v, intnat x) {
    1. [sizes_by_root_id = Val_unit].
       We perform a traversal updating retainer set information in our internal
       hashmap and filling [shared_size] with the total size of elements that
-      are marked [Shared].
+      are marked as shared.
    2. [sizes_by_root_id] is an OCaml array with length equal to the number of
       roots.
       The traversal does not update any retainer set information, but simply
@@ -1368,10 +1367,7 @@ static void add_to_long_value(value *v, intnat x) {
       attributable to each root.
       If [n] roots can reach some memory region, each of them is assigned
       [1/n] of the size of that region.
-      A root with identifier [id] will be associated with array index
-      [id - identifier_offset]. We need this offset in order to be able to have
-      monotonically increasing identifiers which is required for correctness of
-      our traversal.
+      A root with identifier [id] will be associated with array index [id].
 
    If an asynchronous exception occurs when processing pending actions
    caused by other domains, it is written to [exn] and the function exits
@@ -1380,20 +1376,21 @@ static void add_to_long_value(value *v, intnat x) {
 
 static intnat reachable_words_once(struct caml_extern_state *s,
     value root, uintnat identifier, value sizes_by_root_id,
-    intnat identifier_offset, intnat *shared_size, value *exn) {
+    intnat *shared_size, uintnat max_retainer_set_size, value *exn) {
   uintnat stack_size;
   intnat size;
   uintnat mark, new_mark, old_identifier;
   enum reachable_words_node_state state, new_state;
   uintnat h;
   int previously_marked, should_traverse, in_tally_phase;
-  unsigned rounding_tally[RETAINER_SET_MAX_SIZE];
+  unsigned rounding_tally[Retainer_set_size_limit];
   struct caml__roots_block local_root_stack, local_root_hashtbl;
 
   CAMLparam2(root, sizes_by_root_id);
   CAMLlocal1(v);
 
-  CAMLassert(identifier > 0);
+  CAMLassert(identifier >= 0);
+  CAMLassert(max_retainer_set_size >= 2 && max_retainer_set_size <= Retainer_set_size_limit);
 
   local_root_stack.next = *caml_local_roots_ptr;
   *caml_local_roots_ptr = &local_root_stack;
@@ -1495,17 +1492,17 @@ static intnat reachable_words_once(struct caml_extern_state *s,
         state = Decode_state(mark);
         old_identifier = Decode_identifier(mark);
 
-        CAMLassert(state != Invalid && old_identifier <= identifier);
+        CAMLassert(state != Invalid);
         if (old_identifier == identifier) {
           /* We have already visited this node starting from this root */
           should_traverse = 0;
         } else if (state == Root && v == root) {
           should_traverse = 1;
           new_state = Root;
-        } else if (state == Root || state == Shared) {
+        } else if (state == Root || state == max_retainer_set_size) {
           should_traverse = 0;
         } else {
-          CAMLassert(0 < state && state < RETAINER_SET_MAX_SIZE);
+          CAMLassert(0 < state && state < max_retainer_set_size);
           should_traverse = 1;
           if (in_tally_phase) {
             new_state = state;
@@ -1527,18 +1524,18 @@ static intnat reachable_words_once(struct caml_extern_state *s,
 
         /* The block contributes to the total size */
         size += sz_with_header;           /* header word included */
-        if (shared_size != NULL && new_state == Shared) {
+        if (shared_size != NULL && new_state == max_retainer_set_size) {
           *shared_size += sz_with_header;
         }
         if (in_tally_phase) {
           if (new_state == 1 || new_state == Root) {
-            add_to_long_value(&Field(sizes_by_root_id, identifier - identifier_offset),
+            add_to_long_value(&Field(sizes_by_root_id, identifier),
                 sz_with_header);
           } else {
-            CAMLassert(1 < new_state && new_state < RETAINER_SET_MAX_SIZE);
+            CAMLassert(1 < new_state && new_state < max_retainer_set_size);
             uintnat assigned = (sz_with_header + rounding_tally[new_state]) / new_state;
             rounding_tally[new_state] = (sz_with_header + rounding_tally[new_state]) % new_state;
-            add_to_long_value(&Field(sizes_by_root_id, identifier - identifier_offset), assigned);
+            add_to_long_value(&Field(sizes_by_root_id, identifier), assigned);
           }
         }
 
@@ -1594,7 +1591,7 @@ static void reachable_words_mark_root(struct caml_extern_state *s, value v)
     tbl = &s->pos_table;
   }
   lookup_table(tbl, v, &mark, &h);
-  if (record_table(tbl, v, h, Encode(Root, 0)))
+  if (record_table(tbl, v, h, Encode(Root, Max_identifier)))
     extern_out_of_memory(s);
 }
 
@@ -1613,7 +1610,7 @@ CAMLprim value caml_obj_reachable_words(value v)
 
   s = reachable_words_init();
   reachable_words_mark_root(s, v);
-  size = Val_long(reachable_words_once(s, v, 1, Val_unit, 0, NULL, &exn));
+  size = Val_long(reachable_words_once(s, v, 0, Val_unit, NULL, 2, &exn));
   reachable_words_cleanup(s);
   if (Is_exception_result(exn)) {
     CAMLdrop;
@@ -1624,15 +1621,25 @@ CAMLprim value caml_obj_reachable_words(value v)
   CAMLreturn(size);
 }
 
-CAMLprim value caml_obj_uniquely_reachable_words(value v)
+CAMLprim value caml_obj_uniquely_reachable_words(value varr, value vmax_retainer_set_size)
 {
   struct caml_extern_state *s;
-  CAMLparam1(v);
+  uintnat max_retainer_set_size;
+  CAMLparam2(varr, vmax_retainer_set_size);
   CAMLlocal3(sizes_by_root_id, ret, exn);
 
-  intnat length, shared_size = 0;
+  intnat length, shared_size;
 
-  length = Wosize_val(v);
+  max_retainer_set_size = Long_val(vmax_retainer_set_size);
+  length = Wosize_val(varr);
+  if (max_retainer_set_size < 2 || max_retainer_set_size > Retainer_set_size_limit) {
+    caml_invalid_argument("Obj.uniquely_reachable_words: max_retainer_set_size must be between 1 and Retainer_set_size_limit");
+  }
+  if (2 * length >= Max_identifier) {
+    caml_invalid_argument("Obj.uniquely_reachable_words: array size must be less than Max_identifier / 2");
+  }
+
+  shared_size = 0;
   sizes_by_root_id = caml_alloc(length, 0);
   for (intnat i = 0; i < length; i++) {
     Field(sizes_by_root_id, i) = Val_int(0);
@@ -1640,11 +1647,11 @@ CAMLprim value caml_obj_uniquely_reachable_words(value v)
 
   s = reachable_words_init();
   for (intnat i = 0; i < length; i++) {
-    reachable_words_mark_root(s, Field(v, i));
+    reachable_words_mark_root(s, Field(varr, i));
   }
   for (intnat i = 0; i < length; i++) {
-    reachable_words_once(s, Field(v, i), i + 1, Val_unit, 0, &shared_size,
-        &exn);
+    reachable_words_once(s, Field(varr, i), length + i, Val_unit, &shared_size,
+        max_retainer_set_size, &exn);
     if (Is_exception_result(exn)) {
       reachable_words_cleanup(s);
       CAMLdrop;
@@ -1653,8 +1660,8 @@ CAMLprim value caml_obj_uniquely_reachable_words(value v)
     }
   }
   for (intnat i = 0; i < length; i++) {
-    reachable_words_once(s, Field(v, i), length + i + 1, sizes_by_root_id,
-        length + 1, NULL, &exn);
+    reachable_words_once(s, Field(varr, i), i, sizes_by_root_id, NULL,
+        max_retainer_set_size, &exn);
     if (Is_exception_result(exn)) {
       reachable_words_cleanup(s);
       CAMLdrop;

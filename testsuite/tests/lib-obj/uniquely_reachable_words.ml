@@ -8,7 +8,7 @@ let native =
   | Sys.Other s -> print_endline s; assert false
 
 let sizes xs =
-  let individual, shared = Obj.uniquely_reachable_words (List.map Obj.repr xs |> Array.of_list) in
+  let individual, shared = Obj.uniquely_reachable_words ~max_retainer_set_size:2 (List.map Obj.repr xs |> Array.of_list) in
   Array.to_list individual, shared
 
 (* We make object with id i have size about 100 * 2 ** i which allows us to
