@@ -1404,6 +1404,7 @@ static intnat reachable_words_once(struct caml_extern_state *s,
   v = root;
   mark = Invalid;
   in_tally_phase = sizes_by_root_id != Val_unit;
+  memset(rounding_tally, 0, sizeof(rounding_tally));
 
   /* In Multicore OCaml, we don't distinguish between major heap blocks and
    * out-of-heap blocks, so we end up counting out-of-heap blocks too. */

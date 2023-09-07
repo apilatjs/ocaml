@@ -1,16 +1,6 @@
 (* TEST
 *)
 
-let native =
-  match Sys.backend_type with
-  | Sys.Native -> true
-  | Sys.Bytecode -> false
-  | Sys.Other s -> print_endline s; assert false
-
-let sizes xs =
-  let individual, shared = Obj.uniquely_reachable_words ~max_retainer_set_size:2 (List.map Obj.repr xs |> Array.of_list) in
-  Array.to_list individual, shared
-
 (* We make object with id i have size about 100 * 2 ** i which allows us to
  * (approximately) deduce the reachable node ids just from the their total size. *)
 let deduce_reachable size =
@@ -25,17 +15,29 @@ let deduce_reachable size =
   done;
   List.rev !reachable
 
+let expect_equal_int a e =
+  if a <> e then
+    Printf.printf "actual = %d; expected = %d\n" a e
+
 let expect_equal_list a e =
   let string_of_arr x = List.map string_of_int x |> String.concat "," in
   if List.(a <> e) then
     Printf.printf "actual = %s; expected = %s\n" (string_of_arr a) (string_of_arr e)
 
 let expect_reachable roots expected_individual expected_shared =
-  let actual_individual, actual_shared = sizes roots in
+  let actual_individual, actual_shared = Obj.uniquely_reachable_words ~max_retainer_set_size:2
+    (List.map Obj.repr roots |> Array.of_list) in
+  let actual_individual = Array.to_list actual_individual in
   List.combine (List.map deduce_reachable actual_individual) expected_individual
   |> List.iter (fun (a, e) -> expect_equal_list a e);
   expect_equal_list (deduce_reachable actual_shared) expected_shared
 
+let expect_exception f =
+  try
+    f ();
+    Printf.printf "no exception\n"
+  with
+    | _ -> ()
 
 type node = { id: int; used_memory: int array; mutable children: node list }
 let make id ch = { id; used_memory = Array.make (Int.shift_left 100 id) 0; children = ch }
@@ -99,5 +101,65 @@ let[@inline never] f () =
   expect_reachable [n8; n9; n10] [[8]; [9]; [10]] []; (* Leaves *)
 
   ()
+;;
+
+(* Make sure invalid arguments for max_retainer_set_size cause an exception *)
+let g () =
+  let data = [| Obj.repr () |] in
+  expect_exception (fun () -> Obj.uniquely_reachable_words ~max_retainer_set_size:(-3) data);
+  expect_exception (fun () -> Obj.uniquely_reachable_words ~max_retainer_set_size:0 data);
+  expect_exception (fun () -> Obj.uniquely_reachable_words ~max_retainer_set_size:1 data);
+  expect_exception (fun () -> Obj.uniquely_reachable_words ~max_retainer_set_size:254 data);
+  ignore (Obj.uniquely_reachable_words ~max_retainer_set_size:2 data);
+  ignore (Obj.uniquely_reachable_words ~max_retainer_set_size:253 data);
+  ()
+;;
+
+let flip f x y = f y x
+let rec dedup = function
+  | [] -> []
+  | [x] -> [x]
+  | x1 :: x2 :: r ->if x1 = x2 then dedup (x1 :: r) else x1 :: dedup (x2 :: r)
+
+let[@inline never] h ~children_len ~parent_len () =
+  Random.init 123;
+  (* 840 divides the numbers 1 through 8 *)
+  let children = List.init children_len (fun _ -> Array.make 839 0) |> Array.of_list in
+  for max_retainer_set_size = 2 to 9 do
+    (flip List.iter) [1; 2; 3; 5; 10; 25]
+    (fun retainer_set_fraction ->
+      let child_count_per_parent = children_len * max_retainer_set_size / parent_len / retainer_set_fraction in
+      let parents_by_child = Array.make children_len [] in
+      let parents = Array.make parent_len [] in
+      for i = 0 to parent_len - 1 do
+        for _ = 1 to child_count_per_parent do
+          let j = Random.int children_len in
+          parents.(i) <- children.(j) :: parents.(i);
+          parents_by_child.(j) <- i :: parents_by_child.(j)
+        done
+      done;
+      let expected_individual, expected_shared =
+        Array.make parent_len (child_count_per_parent + 1), ref 0 in
+      for j = 0 to children_len - 1 do
+        let cur_parents = dedup parents_by_child.(j) in
+        let len = List.length cur_parents in
+        if len = 0 then
+          ()
+        else if len < max_retainer_set_size then
+          let contribution = 840 / len in
+          List.iter (fun i -> expected_individual.(i) <- contribution + expected_individual.(i))
+            cur_parents
+       else
+         expected_shared := 840 + !expected_shared
+      done;
+      let actual_individual, actual_shared = Array.map (fun p -> Obj.repr (Array.of_list p)) parents
+        |> Obj.uniquely_reachable_words ~max_retainer_set_size in
+      expect_equal_list (Array.to_list actual_individual)
+        (Array.to_list expected_individual);
+      expect_equal_int actual_shared (!expected_shared))
+  done
+;;
 
 let () = f ()
+let () = g ()
+let () = h ~children_len:1000 ~parent_len:200 ()
