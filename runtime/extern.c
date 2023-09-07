@@ -1319,7 +1319,8 @@ CAMLexport void caml_serialize_block_float_8(void * data, intnat len)
    node. This must be an unsigned integer. */
 #define State_shift (8 * sizeof(intnat) - 8)
 #define Max_identifier ((uintnat) ((1ULL << State_shift) - 1))
-#define Decode_state(x) ((enum reachable_words_node_state) ((uintnat)(x) >> State_shift))
+#define Decode_state(x) ((enum reachable_words_node_state) \
+    ((uintnat)(x) >> State_shift))
 #define Decode_identifier(x) ((uintnat) ((uintnat)(x) & Max_identifier))
 #define Encode(st, id) (((uintnat)(st) << State_shift) + (uintnat)(id))
 enum reachable_words_node_state {
@@ -1335,7 +1336,7 @@ enum reachable_words_node_state {
   Retainer_set_size_limit = 0xfd,
 };
 
-static void add_to_long_value(value *v, intnat x) {
+static void add_to_long_value(volatile value *v, intnat x) {
   *v = Val_long(Long_val(*v) + x);
 }
 
@@ -1390,7 +1391,8 @@ static intnat reachable_words_once(struct caml_extern_state *s,
   CAMLlocal1(v);
 
   CAMLassert(identifier >= 0);
-  CAMLassert(max_retainer_set_size >= 2 && max_retainer_set_size <= Retainer_set_size_limit);
+  CAMLassert(max_retainer_set_size >= 2
+      && max_retainer_set_size <= Retainer_set_size_limit);
 
   local_root_stack.next = *caml_local_roots_ptr;
   *caml_local_roots_ptr = &local_root_stack;
@@ -1534,8 +1536,10 @@ static intnat reachable_words_once(struct caml_extern_state *s,
                 sz_with_header);
           } else {
             CAMLassert(1 < new_state && new_state < max_retainer_set_size);
-            uintnat assigned = (sz_with_header + rounding_tally[new_state]) / new_state;
-            rounding_tally[new_state] = (sz_with_header + rounding_tally[new_state]) % new_state;
+            uintnat assigned =
+              (sz_with_header + rounding_tally[new_state]) / new_state;
+            rounding_tally[new_state] =
+              (sz_with_header + rounding_tally[new_state]) % new_state;
             add_to_long_value(&Field(sizes_by_root_id, identifier), assigned);
           }
         }
@@ -1622,7 +1626,8 @@ CAMLprim value caml_obj_reachable_words(value v)
   CAMLreturn(size);
 }
 
-CAMLprim value caml_obj_uniquely_reachable_words(value varr, value vmax_retainer_set_size)
+CAMLprim value caml_obj_uniquely_reachable_words(value varr,
+    value vmax_retainer_set_size)
 {
   struct caml_extern_state *s;
   uintnat max_retainer_set_size;
@@ -1633,11 +1638,14 @@ CAMLprim value caml_obj_uniquely_reachable_words(value varr, value vmax_retainer
 
   max_retainer_set_size = Long_val(vmax_retainer_set_size);
   length = Wosize_val(varr);
-  if (max_retainer_set_size < 2 || max_retainer_set_size > Retainer_set_size_limit) {
-    caml_invalid_argument("Obj.uniquely_reachable_words: max_retainer_set_size must be between 1 and Retainer_set_size_limit");
+  if (max_retainer_set_size < 2
+      || max_retainer_set_size > Retainer_set_size_limit) {
+    caml_invalid_argument("Obj.uniquely_reachable_words: "
+        "max_retainer_set_size must be between 1 and Retainer_set_size_limit");
   }
   if (2 * length >= Max_identifier) {
-    caml_invalid_argument("Obj.uniquely_reachable_words: array size must be less than Max_identifier / 2");
+    caml_invalid_argument("Obj.uniquely_reachable_words: "
+        "array size must be less than Max_identifier / 2");
   }
 
   shared_size = 0;
